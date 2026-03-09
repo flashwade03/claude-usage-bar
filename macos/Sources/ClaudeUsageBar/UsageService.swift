@@ -16,17 +16,26 @@ class UsageService: ObservableObject {
     var notificationService: NotificationService?
 
     private var timer: Timer?
-    private let usageEndpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-    private let userinfoEndpoint = URL(string: "https://api.anthropic.com/api/oauth/userinfo")!
+    private let session: URLSession
+    private let usageEndpoint: URL
+    private let userinfoEndpoint: URL
+    private let tokenEndpoint: URL
+    private let credentialsStore: StoredCredentialsStore
+    private let localProfileLoader: @MainActor () -> String?
     private var currentInterval: TimeInterval
+    private var refreshTask: Task<Bool, Never>?
 
     static let defaultPollingMinutes = 30
     static let pollingOptions = [5, 15, 30, 60]
     nonisolated static let maxBackoffInterval: TimeInterval = 60 * 60
+    nonisolated static let defaultOAuthScopes = ["user:profile", "user:inference"]
+    nonisolated private static let authorizeEndpoint = URL(string: "https://claude.ai/oauth/authorize")!
+    nonisolated private static let defaultUsageEndpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+    nonisolated private static let defaultUserinfoEndpoint = URL(string: "https://api.anthropic.com/api/oauth/userinfo")!
+    nonisolated private static let defaultTokenEndpoint = URL(string: "https://platform.claude.com/v1/oauth/token")!
+    nonisolated private static let defaultRedirectURI = "https://platform.claude.com/oauth/code/callback"
 
     @Published private(set) var pollingMinutes: Int
-
-    private var refreshTask: Task<StoredCredentials?, Never>?
 
     func updatePollingInterval(_ minutes: Int) {
         pollingMinutes = minutes
@@ -49,8 +58,7 @@ class UsageService: ObservableObject {
 
     // OAuth constants
     private let clientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    private let redirectUri = "https://console.anthropic.com/oauth/code/callback"
-    private let tokenEndpoint = URL(string: "https://console.anthropic.com/v1/oauth/token")!
+    private let redirectUri: String
 
     // PKCE state (lives only during an auth flow)
     private var codeVerifier: String?
@@ -62,12 +70,27 @@ class UsageService: ObservableObject {
     var reset5h: Date? { usage?.fiveHour?.resetsAtDate }
     var reset7d: Date? { usage?.sevenDay?.resetsAtDate }
 
-    init() {
+    init(
+        session: URLSession = .shared,
+        usageEndpoint: URL = UsageService.defaultUsageEndpoint,
+        userinfoEndpoint: URL = UsageService.defaultUserinfoEndpoint,
+        tokenEndpoint: URL = UsageService.defaultTokenEndpoint,
+        redirectUri: String = UsageService.defaultRedirectURI,
+        credentialsStore: StoredCredentialsStore = StoredCredentialsStore(),
+        localProfileLoader: @MainActor @escaping () -> String? = UsageService.loadLocalProfile
+    ) {
+        self.session = session
+        self.usageEndpoint = usageEndpoint
+        self.userinfoEndpoint = userinfoEndpoint
+        self.tokenEndpoint = tokenEndpoint
+        self.redirectUri = redirectUri
+        self.credentialsStore = credentialsStore
+        self.localProfileLoader = localProfileLoader
         let stored = UserDefaults.standard.integer(forKey: "pollingMinutes")
         let minutes = Self.pollingOptions.contains(stored) ? stored : Self.defaultPollingMinutes
         self.pollingMinutes = minutes
         self.currentInterval = TimeInterval(minutes * 60)
-        isAuthenticated = StoredCredentials.load() != nil
+        isAuthenticated = loadCredentials() != nil
     }
 
     // MARK: - Polling
@@ -93,109 +116,6 @@ class UsageService: ObservableObject {
         timer = t
     }
 
-    // MARK: - Token Refresh
-
-    private func validAccessToken() async -> String? {
-        guard let credentials = StoredCredentials.load() else { return nil }
-
-        guard credentials.needsRefresh else {
-            return credentials.accessToken
-        }
-
-        guard credentials.hasRefreshToken else {
-            // Legacy migration: no refresh token, return existing token directly
-            return credentials.accessToken
-        }
-
-        if let refreshed = await coalescedRefresh(credentials: credentials) {
-            return refreshed.accessToken
-        }
-
-        // Refresh failed — return existing token anyway; it may still work
-        return credentials.accessToken
-    }
-
-    private func coalescedRefresh(credentials: StoredCredentials) async -> StoredCredentials? {
-        if let existing = refreshTask {
-            return await existing.value
-        }
-
-        let task = Task { await performRefresh(credentials: credentials) }
-        refreshTask = task
-        defer { refreshTask = nil }
-        return await task.value
-    }
-
-    private func performRefresh(credentials: StoredCredentials) async -> StoredCredentials? {
-        guard credentials.hasRefreshToken else { return nil }
-
-        var request = URLRequest(url: tokenEndpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
-
-        let body: [String: String] = [
-            "grant_type": "refresh_token",
-            "refresh_token": credentials.refreshToken,
-            "client_id": clientId,
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let responseTime = Date()
-
-            guard let http = response as? HTTPURLResponse else {
-                lastError = "Invalid refresh response"
-                print("[UsageService] Token refresh returned non-HTTP response")
-                return nil
-            }
-
-            if http.statusCode == 400 || http.statusCode == 401 {
-                // Permanent rejection — delete credentials to prevent retry loops
-                StoredCredentials.delete()
-                lastError = "Refresh token rejected (HTTP \(http.statusCode)) — please sign in again"
-                return nil
-            }
-
-            guard http.statusCode == 200 else {
-                lastError = "Token refresh failed: HTTP \(http.statusCode)"
-                print("[UsageService] Token refresh failed: HTTP \(http.statusCode)")
-                return nil
-            }
-
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let accessToken = json["access_token"] as? String else {
-                lastError = "Could not parse refresh response"
-                print("[UsageService] Could not parse token refresh response")
-                return nil
-            }
-
-            let refreshToken = json["refresh_token"] as? String ?? credentials.refreshToken
-            let expiresIn = json["expires_in"] as? Double ?? 3600
-            let expiresAt = responseTime.addingTimeInterval(expiresIn)
-
-            let newCredentials = StoredCredentials(
-                accessToken: accessToken,
-                refreshToken: refreshToken,
-                expiresAt: expiresAt
-            )
-
-            do {
-                try newCredentials.save()
-            } catch {
-                print("[UsageService] Failed to save refreshed credentials: \(error)")
-            }
-
-            lastError = nil
-            return newCredentials
-        } catch {
-            lastError = "Token refresh error: \(error.localizedDescription)"
-            print("[UsageService] Token refresh error: \(error.localizedDescription)")
-            return nil
-        }
-    }
-
     // MARK: - OAuth PKCE Flow
 
     func startOAuthFlow() {
@@ -206,13 +126,13 @@ class UsageService: ObservableObject {
         codeVerifier = verifier
         oauthState = state
 
-        var components = URLComponents(string: "https://claude.ai/oauth/authorize")!
+        var components = URLComponents(url: Self.authorizeEndpoint, resolvingAgainstBaseURL: false)!
         components.queryItems = [
             URLQueryItem(name: "code", value: "true"),
             URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "redirect_uri", value: redirectUri),
-            URLQueryItem(name: "scope", value: "user:profile user:inference"),
+            URLQueryItem(name: "scope", value: Self.defaultOAuthScopes.joined(separator: " ")),
             URLQueryItem(name: "code_challenge", value: challenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "state", value: state),
@@ -262,9 +182,7 @@ class UsageService: ObservableObject {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let responseTime = Date()
-
+            let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else {
                 lastError = "Invalid token response"
                 return
@@ -276,28 +194,17 @@ class UsageService: ObservableObject {
             }
 
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let accessToken = json["access_token"] as? String else {
+                  let credentials = credentials(from: json) else {
                 lastError = "Could not parse token response"
                 return
             }
 
-            let refreshToken = json["refresh_token"] as? String ?? ""
-            let expiresIn = json["expires_in"] as? Double ?? 3600
-            let expiresAt = responseTime.addingTimeInterval(expiresIn)
-
-            let credentials = StoredCredentials(
-                accessToken: accessToken,
-                refreshToken: refreshToken,
-                expiresAt: expiresAt
-            )
-
             do {
-                try credentials.save()
+                try saveCredentials(credentials)
             } catch {
                 lastError = "Failed to save credentials: \(error.localizedDescription)"
                 return
             }
-
             isAuthenticated = true
             isAwaitingCode = false
             lastError = nil
@@ -312,12 +219,16 @@ class UsageService: ObservableObject {
     }
 
     func signOut() {
-        StoredCredentials.delete()
+        deleteCredentials()
         isAuthenticated = false
         usage = nil
-        lastError = nil
         lastUpdated = nil
         accountEmail = nil
+        timer?.invalidate()
+        timer = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        lastError = nil
     }
 
     // MARK: - PKCE Helpers
@@ -336,50 +247,17 @@ class UsageService: ObservableObject {
     // MARK: - API Fetch
 
     func fetchUsage() async {
-        guard let token = await validAccessToken() else {
+        guard loadCredentials() != nil else {
             lastError = "Not signed in"
             isAuthenticated = false
             return
         }
 
-        var request = URLRequest(url: usageEndpoint)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                lastError = "Invalid response"
+            guard let result = try await sendAuthorizedRequest(to: usageEndpoint) else {
                 return
             }
-            if http.statusCode == 401 {
-                // Attempt token refresh before signing out
-                if let credentials = StoredCredentials.load(),
-                   credentials.hasRefreshToken,
-                   let refreshed = await coalescedRefresh(credentials: credentials) {
-                    // Retry with refreshed token
-                    var retryRequest = URLRequest(url: usageEndpoint)
-                    retryRequest.setValue("Bearer \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
-                    retryRequest.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-
-                    do {
-                        let (retryData, retryResponse) = try await URLSession.shared.data(for: retryRequest)
-                        guard let retryHttp = retryResponse as? HTTPURLResponse,
-                              retryHttp.statusCode == 200 else {
-                            signOut()
-                            return
-                        }
-                        let decoded = try JSONDecoder().decode(UsageResponse.self, from: retryData)
-                        handleSuccessfulUsageResponse(decoded)
-                    } catch {
-                        signOut()
-                    }
-                } else {
-                    lastError = "Session expired — please sign in again"
-                    signOut()
-                }
-                return
-            }
+            let (data, http) = result
             if http.statusCode == 429 {
                 let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
                     .flatMap(Double.init) ?? currentInterval
@@ -396,72 +274,41 @@ class UsageService: ObservableObject {
                 return
             }
             let decoded = try JSONDecoder().decode(UsageResponse.self, from: data)
-            handleSuccessfulUsageResponse(decoded)
+            let reconciled = decoded.reconciled(with: usage)
+            usage = reconciled
+            lastError = nil
+            lastUpdated = Date()
+            historyService?.recordDataPoint(pct5h: pct5h, pct7d: pct7d)
+            notificationService?.checkAndNotify(pct5h: pct5h, pct7d: pct7d, pctExtra: pctExtra)
+            if currentInterval != baseInterval {
+                currentInterval = baseInterval
+                scheduleTimer()
+            }
         } catch {
             lastError = error.localizedDescription
-        }
-    }
-
-    private func handleSuccessfulUsageResponse(_ decoded: UsageResponse) {
-        let reconciled = decoded.reconciled(with: usage)
-        usage = reconciled
-        lastError = nil
-        lastUpdated = Date()
-        historyService?.recordDataPoint(pct5h: pct5h, pct7d: pct7d)
-        notificationService?.checkAndNotify(pct5h: pct5h, pct7d: pct7d, pctExtra: pctExtra)
-        if currentInterval != baseInterval {
-            currentInterval = baseInterval
-            scheduleTimer()
         }
     }
 
     // MARK: - Profile
 
     func fetchProfile() async {
-        if let local = Self.loadLocalProfile() {
+        if let local = localProfileLoader() {
             accountEmail = local
             return
         }
 
-        guard let token = await validAccessToken() else { return }
-
-        var request = URLRequest(url: userinfoEndpoint)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse else {
+        guard let result = try? await sendAuthorizedRequest(
+            to: userinfoEndpoint,
+            expireSessionOnAuthFailure: false
+        ) else {
             return
         }
-
-        if http.statusCode == 401 {
-            // Attempt token refresh — do NOT sign out on failure (fetchProfile is not the session authority)
-            if let credentials = StoredCredentials.load(),
-               credentials.hasRefreshToken,
-               let refreshed = await coalescedRefresh(credentials: credentials) {
-                var retryRequest = URLRequest(url: userinfoEndpoint)
-                retryRequest.setValue("Bearer \(refreshed.accessToken)", forHTTPHeaderField: "Authorization")
-                retryRequest.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-
-                guard let (retryData, retryResponse) = try? await URLSession.shared.data(for: retryRequest),
-                      let retryHttp = retryResponse as? HTTPURLResponse,
-                      retryHttp.statusCode == 200,
-                      let json = try? JSONSerialization.jsonObject(with: retryData) as? [String: Any] else {
-                    return
-                }
-                parseProfileResponse(json)
-            }
-            return
-        }
-
+        let (data, http) = result
         guard http.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
         }
-        parseProfileResponse(json)
-    }
 
-    private func parseProfileResponse(_ json: [String: Any]) {
         if let email = json["email"] as? String, !email.isEmpty {
             accountEmail = email
         } else if let name = json["name"] as? String, !name.isEmpty {
@@ -485,6 +332,197 @@ class UsageService: ObservableObject {
             return name
         }
         return nil
+    }
+
+    // MARK: - Credential storage
+
+    private func saveCredentials(_ credentials: StoredCredentials) throws {
+        try credentialsStore.save(credentials)
+    }
+
+    private func loadCredentials() -> StoredCredentials? {
+        credentialsStore.load(defaultScopes: Self.defaultOAuthScopes)
+    }
+
+    private func deleteCredentials() {
+        credentialsStore.delete()
+    }
+
+    // MARK: - Authorized requests
+
+    private func sendAuthorizedRequest(
+        to url: URL,
+        expireSessionOnAuthFailure: Bool = true
+    ) async throws -> (Data, HTTPURLResponse)? {
+        guard let initialCredentials = loadCredentials() else {
+            lastError = "Not signed in"
+            isAuthenticated = false
+            return nil
+        }
+
+        if initialCredentials.needsRefresh() {
+            _ = await refreshCredentials(force: true)
+        }
+
+        let activeCredentials = loadCredentials() ?? initialCredentials
+
+        var result = try await performAuthorizedRequest(
+            token: activeCredentials.accessToken,
+            url: url
+        )
+
+        if result.1.statusCode != 401 {
+            return result
+        }
+
+        guard await refreshCredentials(force: true),
+              let refreshedCredentials = loadCredentials() else {
+            if expireSessionOnAuthFailure {
+                expireSession()
+            }
+            return nil
+        }
+
+        result = try await performAuthorizedRequest(
+            token: refreshedCredentials.accessToken,
+            url: url
+        )
+
+        if result.1.statusCode == 401 {
+            if expireSessionOnAuthFailure {
+                expireSession()
+            }
+            return nil
+        }
+
+        return result
+    }
+
+    private func performAuthorizedRequest(
+        token: String,
+        url: URL
+    ) async throws -> (Data, HTTPURLResponse) {
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        return (data, http)
+    }
+
+    private func refreshCredentials(force: Bool) async -> Bool {
+        if let refreshTask {
+            return await refreshTask.value
+        }
+
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            return await self.performRefresh(force: force)
+        }
+        refreshTask = task
+        let refreshed = await task.value
+        refreshTask = nil
+        return refreshed
+    }
+
+    private func performRefresh(force: Bool) async -> Bool {
+        guard let currentCredentials = loadCredentials(),
+              let refreshToken = currentCredentials.refreshToken,
+              refreshToken.isEmpty == false else {
+            return false
+        }
+
+        if force == false, currentCredentials.needsRefresh() == false {
+            return true
+        }
+
+        var request = URLRequest(url: tokenEndpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        var body: [String: String] = [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": clientId,
+        ]
+        if currentCredentials.scopes.isEmpty == false {
+            body["scope"] = currentCredentials.scopes.joined(separator: " ")
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let updatedCredentials = credentials(
+                    from: json,
+                    fallback: currentCredentials
+                  ) else {
+                return false
+            }
+
+            try saveCredentials(updatedCredentials)
+            isAuthenticated = true
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func credentials(
+        from json: [String: Any],
+        fallback: StoredCredentials? = nil
+    ) -> StoredCredentials? {
+        guard let accessToken = json["access_token"] as? String, accessToken.isEmpty == false else {
+            return nil
+        }
+
+        let scopeString = json["scope"] as? String
+        let scopes = scopeString?
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init) ?? fallback?.scopes ?? Self.defaultOAuthScopes
+
+        return StoredCredentials(
+            accessToken: accessToken,
+            refreshToken: (json["refresh_token"] as? String) ?? fallback?.refreshToken,
+            expiresAt: Self.expirationDate(from: json["expires_in"]) ?? fallback?.expiresAt,
+            scopes: scopes
+        )
+    }
+
+    private static func expirationDate(from value: Any?) -> Date? {
+        let seconds: TimeInterval?
+        switch value {
+        case let number as NSNumber:
+            seconds = number.doubleValue
+        case let number as Double:
+            seconds = number
+        case let number as Int:
+            seconds = TimeInterval(number)
+        case let string as String:
+            seconds = TimeInterval(string)
+        default:
+            seconds = nil
+        }
+
+        guard let seconds else { return nil }
+        return Date().addingTimeInterval(seconds)
+    }
+
+    private func expireSession() {
+        deleteCredentials()
+        isAuthenticated = false
+        usage = nil
+        lastUpdated = nil
+        accountEmail = nil
+        timer?.invalidate()
+        timer = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        lastError = "Session expired — please sign in again"
     }
 }
 

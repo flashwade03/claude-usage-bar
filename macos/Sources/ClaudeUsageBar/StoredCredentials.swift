@@ -1,118 +1,87 @@
-// StoredCredentials uses file-based storage instead of Keychain because the app
-// ships with ad-hoc signing, which causes Keychain access prompts on every
-// launch. File storage with restricted permissions (0700 directory, 0600 file)
-// avoids this issue while still protecting credentials at rest.
-
 import Foundation
 
-struct StoredCredentials: Codable {
+struct StoredCredentials: Codable, Equatable {
     let accessToken: String
-    let refreshToken: String
-    let expiresAt: Date
-
-    static let tokenFileName = "token"
-
-    static var configDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/claude-usage-bar")
-    }
-
-    // MARK: - Computed Properties
-
-    var isExpired: Bool {
-        Date() >= expiresAt
-    }
-
-    var needsRefresh: Bool {
-        Date() >= expiresAt.addingTimeInterval(-300)
-    }
+    let refreshToken: String?
+    let expiresAt: Date?
+    let scopes: [String]
 
     var hasRefreshToken: Bool {
-        !refreshToken.isEmpty
+        guard let refreshToken else { return false }
+        return refreshToken.isEmpty == false
     }
 
-    // MARK: - Persistence
+    func needsRefresh(at now: Date = Date(), leeway: TimeInterval = 60) -> Bool {
+        guard hasRefreshToken, let expiresAt else { return false }
+        return expiresAt <= now.addingTimeInterval(leeway)
+    }
+}
 
-    func save(baseDirectory: URL? = nil) throws {
-        let dir = baseDirectory ?? Self.configDirectory
-        let fileURL: URL
-        if baseDirectory != nil {
-            fileURL = dir.appendingPathComponent(Self.tokenFileName)
-        } else {
-            fileURL = Self.configDirectory.appendingPathComponent(Self.tokenFileName)
+struct StoredCredentialsStore {
+    private let fileManager: FileManager
+    let directoryURL: URL
+    let credentialsFileURL: URL
+    let legacyTokenFileURL: URL
+
+    init(
+        directoryURL: URL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/claude-usage-bar", isDirectory: true),
+        fileManager: FileManager = .default
+    ) {
+        self.fileManager = fileManager
+        self.directoryURL = directoryURL
+        self.credentialsFileURL = directoryURL.appendingPathComponent("credentials.json")
+        self.legacyTokenFileURL = directoryURL.appendingPathComponent("token")
+    }
+
+    func save(_ credentials: StoredCredentials) throws {
+        try ensureDirectoryExists()
+        let data = try Self.encoder.encode(credentials)
+        try data.write(to: credentialsFileURL, options: .atomic)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsFileURL.path)
+        try? fileManager.removeItem(at: legacyTokenFileURL)
+    }
+
+    func load(defaultScopes: [String]) -> StoredCredentials? {
+        if let data = try? Data(contentsOf: credentialsFileURL),
+           let credentials = try? Self.decoder.decode(StoredCredentials.self, from: data) {
+            return credentials
         }
 
-        try FileManager.default.createDirectory(
-            at: dir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
+        guard let data = try? Data(contentsOf: legacyTokenFileURL),
+              let token = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              token.isEmpty == false else {
+            return nil
+        }
 
+        return StoredCredentials(
+            accessToken: token,
+            refreshToken: nil,
+            expiresAt: nil,
+            scopes: defaultScopes
+        )
+    }
+
+    func delete() {
+        try? fileManager.removeItem(at: credentialsFileURL)
+        try? fileManager.removeItem(at: legacyTokenFileURL)
+    }
+
+    private func ensureDirectoryExists() throws {
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
+    }
+
+    private static let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(self)
-        try data.write(to: fileURL, options: .atomic)
+        return encoder
+    }()
 
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: fileURL.path
-        )
-    }
-
-    static func load(baseDirectory: URL? = nil) -> StoredCredentials? {
-        let fileURL: URL
-        if let baseDirectory = baseDirectory {
-            fileURL = baseDirectory.appendingPathComponent(tokenFileName)
-        } else {
-            fileURL = configDirectory.appendingPathComponent(tokenFileName)
-        }
-
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            return nil
-        }
-
-        guard let data = try? Data(contentsOf: fileURL) else {
-            return nil
-        }
-
-        guard !data.isEmpty else {
-            return nil
-        }
-
+    private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-
-        do {
-            return try decoder.decode(StoredCredentials.self, from: data)
-        } catch {
-            print("[StoredCredentials] JSON decode failed: \(error)")
-
-            // Legacy migration: try reading as plain-text access token
-            guard let raw = String(data: data, encoding: .utf8) else {
-                return nil
-            }
-
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                return nil
-            }
-
-            return StoredCredentials(
-                accessToken: trimmed,
-                refreshToken: "",
-                expiresAt: .distantFuture
-            )
-        }
-    }
-
-    static func delete(baseDirectory: URL? = nil) {
-        let fileURL: URL
-        if let baseDirectory = baseDirectory {
-            fileURL = baseDirectory.appendingPathComponent(tokenFileName)
-        } else {
-            fileURL = configDirectory.appendingPathComponent(tokenFileName)
-        }
-
-        try? FileManager.default.removeItem(at: fileURL)
-    }
+        return decoder
+    }()
 }
